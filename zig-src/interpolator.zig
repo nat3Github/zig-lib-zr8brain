@@ -512,41 +512,49 @@ pub fn FracInterpolator(comptime T: type) type {
 
         fn convolve2N(self: *Self, comptime fltlen: usize, op_in: *[]T) void {
             const fb = self.filter_bank;
+            // element_size 3: filter i starts at i * fltlen * 3.
+            const table = fb.table.ptr;
             const ssr = self.src_sample_rate;
             const dsr = self.dst_sample_rate;
+            // Locals, not self fields: stores through op may alias self for the optimizer.
+            var in_counter = self.in_counter;
+            var in_pos_int = self.in_pos_int;
+            const in_pos_shift = self.in_pos_shift;
             var fpos = self.in_pos_frac;
             var rpos = self.read_pos;
             var bl = @as(isize, @intCast(self.buf_left)) - @as(isize, @intCast(self.fl2));
-            var op = op_in.*;
+            const op = op_in.*.ptr;
+            var n: usize = 0;
 
             const fracs_f = @as(f64, @floatFromInt(fb.filter_fracs));
 
-            while (bl > 0) {
+            while (bl > 0 and n < op_in.len) : (n += 1) {
                 var x = fpos * fracs_f;
                 const fti = @as(usize, @intFromFloat(x));
                 x -= @as(f64, @floatFromInt(fti));
                 const x2d = x * x;
-                
-                const ftp = fb.getFilter(fti);
-                op[0] = convolveQuadratic(ftp, self.buf[rpos..], fltlen, x, x2d);
-                op = op[1..];
 
-                self.in_counter += 1;
-                const next_in_pos = (@as(f64, @floatFromInt(self.in_counter)) + self.in_pos_shift) * ssr / dsr;
-                const next_in_pos_int = @as(i32, @intFromFloat(@floor(next_in_pos)));
-                const pos_incr = next_in_pos_int - self.in_pos_int;
-                self.in_pos_int = next_in_pos_int;
+                const ftp = table + fti * fltlen * 3;
+                op[n] = convolveQuadratic(ftp[0 .. fltlen * 3], self.buf[rpos..], fltlen, x, x2d);
+
+                in_counter += 1;
+                // C++ order of ops (bit parity); NextInPos >= 0 so truncation == floor.
+                const next_in_pos = (@as(f64, @floatFromInt(in_counter)) + in_pos_shift) * ssr / dsr;
+                const next_in_pos_int = @as(i32, @intFromFloat(next_in_pos));
+                const pos_incr = next_in_pos_int - in_pos_int;
+                in_pos_int = next_in_pos_int;
                 fpos = next_in_pos - @as(f64, @floatFromInt(next_in_pos_int));
 
                 rpos = (rpos + @as(usize, @intCast(pos_incr))) & buf_len_mask;
                 bl -= pos_incr;
-                if (op.len == 0) break;
             }
 
+            self.in_counter = in_counter;
+            self.in_pos_int = in_pos_int;
             self.buf_left = @intCast(bl + @as(isize, @intCast(self.fl2)));
             self.read_pos = rpos;
             self.in_pos_frac = fpos;
-            op_in.* = op;
+            op_in.* = op_in.*[n..];
         }
 
         pub fn process(self: *Self, ip_in: []const T, op_full: []T) usize {
