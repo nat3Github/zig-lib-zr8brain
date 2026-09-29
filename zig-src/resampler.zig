@@ -306,28 +306,28 @@ pub fn Resampler(comptime T: type) type {
                 for (ip0) |s| std.debug.assert(!std.math.isNan(s));
             }
 
-            if (self.processors.items.len == 0) {
-                const len = @min(ip0.len, op_full.len);
-                for (0..len) |i| op_full[i] = ip0[i];
-                return len;
-            }
+            const out = if (T == f64) self.processRaw(ip0) else blk: {
+                const in64 = self.tmp_bufs[0][0..ip0.len];
+                for (in64, ip0) |*d, s| d.* = @floatCast(s);
+                break :blk self.processRaw(in64);
+            };
+            const out_len = @min(out.len, op_full.len);
+            for (op_full[0..out_len], out[0..out_len]) |*d, s| d.* = @floatCast(s);
+            return out_len;
+        }
 
+        /// C++ CDSPResampler::process semantics: `ip` is read in place and the
+        /// result aliases an internal buffer, valid until the next call.
+        pub fn processRaw(self: *Self, ip0: []const f64) []const f64 {
             var l = ip0.len;
-            const op_start0 = self.tmp_bufs[0].ptr;
-            for (0..l) |i| op_start0[i] = @floatCast(ip0[i]);
-
-            var ip = op_start0;
-            for (0..self.processors.items.len) |i| {
-                const p = self.processors.items[i];
+            var ip = ip0.ptr;
+            for (self.processors.items, 0..) |p, i| {
                 const op_start = self.tmp_bufs[(i + 1) & 1].ptr;
                 var op_ptr = op_start;
                 l = p.process(ip, l, &op_ptr);
                 ip = op_start;
             }
-
-            const out_len = @min(l, op_full.len);
-            for (0..out_len) |i| op_full[i] = @floatCast(ip[i]);
-            return out_len;
+            return ip[0..l];
         }
 
         pub fn clear(self: *Self) void {

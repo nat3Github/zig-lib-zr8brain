@@ -32,7 +32,6 @@ pub const R8bResampler = struct {
     inner: *resampler.Resampler(f64),
     allocator: std.mem.Allocator,
     input_conv: []f64,
-    output_scratch: []f64,
 
     pub fn init(allocator: std.mem.Allocator, input_rate: f64, output_rate: f64, max_in_len: u32, req_trans_band: f64, cache: *FIRFilterCache) !R8bResampler {
         return initWithQuality(allocator, input_rate, output_rate, max_in_len, req_trans_band, .quality24, cache);
@@ -43,24 +42,17 @@ pub const R8bResampler = struct {
         errdefer inner.deinit();
 
         const input_conv = try allocator.alloc(f64, max_in_len);
-        errdefer allocator.free(input_conv);
-
-        const max_out = inner.getMaxOutLen(max_in_len);
-        const output_scratch = try allocator.alloc(f64, max_out);
-        errdefer allocator.free(output_scratch);
 
         return .{
             .inner = inner,
             .allocator = allocator,
             .input_conv = input_conv,
-            .output_scratch = output_scratch,
         };
     }
 
     pub fn deinit(self: *R8bResampler) void {
         self.inner.deinit();
         self.allocator.free(self.input_conv);
-        self.allocator.free(self.output_scratch);
     }
 
     pub fn clear(self: *R8bResampler) void {
@@ -69,17 +61,21 @@ pub const R8bResampler = struct {
 
     pub fn process(self: *R8bResampler, input: []const f32, output: []f32) usize {
         const l = @min(input.len, self.input_conv.len);
-        for (input[0..l], 0..) |v, i| {
-            self.input_conv[i] = @as(f64, @floatCast(v));
-        }
-
-        const produced = self.inner.process(self.input_conv[0..l], self.output_scratch);
-
-        const out_len = @min(produced, output.len);
-        for (0..out_len) |i| {
-            output[i] = @as(f32, @floatCast(self.output_scratch[i]));
-        }
+        convert(self.input_conv[0..l], input[0..l]);
+        const out = self.inner.processRaw(self.input_conv[0..l]);
+        const out_len = @min(out.len, output.len);
+        convert(output[0..out_len], out[0..out_len]);
         return out_len;
+    }
+
+    /// Explicit SIMD: LLVM leaves these f32<->f64 loops scalar.
+    fn convert(dst: anytype, src: anytype) void {
+        const D = @typeInfo(@TypeOf(dst)).pointer.child;
+        const S = @typeInfo(@TypeOf(src)).pointer.child;
+        const n = 8;
+        var i: usize = 0;
+        while (i + n <= dst.len) : (i += n) dst[i..][0..n].* = @as(@Vector(n, D), @floatCast(@as(@Vector(n, S), src[i..][0..n].*)));
+        while (i < dst.len) : (i += 1) dst[i] = @floatCast(src[i]);
     }
 
     pub fn getInLenBeforeOutPos(self: *const R8bResampler, req_out_pos: i32) i32 {
