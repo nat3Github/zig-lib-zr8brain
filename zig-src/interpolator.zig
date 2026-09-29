@@ -66,13 +66,6 @@ pub const FracDelayFilterBank = struct {
         const table_pos8 = filter_size * 7;
         const table_end_idx = (actual_fracs + 1) * filter_size;
         
-        // r8brain's C++ applies shuffle2_{2,3,4} here ONLY under R8B_SIMD_ISH,
-        // to reorder the coefficient table for its SSE2/NEON convolution
-        // kernels. convolve0/convolve2 in this port are scalar and read the
-        // table sequentially, so the shuffle MUST NOT be applied — applying it
-        // corrupts every fractional (non-whole-stepping) resampling ratio
-        // (~6 dB SNR vs the reference). See shuffle2_* below: kept dead for a
-        // future SIMD kernel.
         var p_off: usize = 0;
         if (interp_points == 8) {
             if (element_size == 3) {
@@ -80,6 +73,22 @@ pub const FracDelayFilterBank = struct {
                     base.calcSpline2p8Coeffs(table[p_off..], table[p_off], table[p_off + table_pos2],
                         table[p_off + table_pos3], table[p_off + table_pos4], table[p_off + table_pos5],
                         table[p_off + table_pos6], table[p_off + table_pos7], table[p_off + table_pos8]);
+                }
+                // Like C++ shuffle2_3 under R8B_SIMD_ISH, but for fir_lanes:
+                // each full block of L taps becomes [f0 x L][f1 x L][f2 x L] so
+                // convolveQuadratic does contiguous loads. Tail stays interleaved.
+                const L = base.fir_lanes;
+                var tmp: [3 * L]f64 = undefined;
+                var f: usize = 0;
+                while (f < table_end_idx) : (f += filter_size) {
+                    var t: usize = 0;
+                    while (t + L <= self.filter_len) : (t += L) {
+                        const blk = table[f + t * 3 ..][0 .. 3 * L];
+                        for (0..3) |k| for (0..L) |j| {
+                            tmp[k * L + j] = blk[j * 3 + k];
+                        };
+                        @memcpy(blk, &tmp);
+                    }
                 }
             } else if (element_size == 4) {
                 while (p_off < table_end_idx) : (p_off += element_size) {
@@ -151,47 +160,6 @@ pub const FracDelayFilterBank = struct {
             att.* = Coeffs2[i][2];
             fltlen.* = @intCast(coeffs2_base + i * 2);
             return Coeffs2[i][0..2];
-        }
-    }
-
-    fn shuffle2_2(p: []f64) void {
-        var i: usize = 0;
-        while (i < p.len) : (i += 4) {
-            const t = p[i + 2];
-            p[i + 2] = p[i + 1];
-            p[i + 1] = t;
-        }
-    }
-
-    fn shuffle2_3(p: []f64) void {
-        var i: usize = 0;
-        while (i < p.len) : (i += 6) {
-            const t1 = p[i + 1];
-            const t2 = p[i + 2];
-            const t3 = p[i + 3];
-            const t4 = p[i + 4];
-            p[i + 1] = t3;
-            p[i + 2] = t1;
-            p[i + 3] = t4;
-            p[i + 4] = t2;
-        }
-    }
-
-    fn shuffle2_4(p: []f64) void {
-        var i: usize = 0;
-        while (i < p.len) : (i += 8) {
-            const t1 = p[i + 1];
-            const t2 = p[i + 2];
-            const t3 = p[i + 3];
-            const t4 = p[i + 4];
-            const t5 = p[i + 5];
-            const t6 = p[i + 6];
-            p[i + 1] = t4;
-            p[i + 2] = t1;
-            p[i + 3] = t5;
-            p[i + 4] = t2;
-            p[i + 5] = t6;
-            p[i + 6] = t3;
         }
     }
 };
@@ -508,26 +476,18 @@ pub fn FracInterpolator(comptime T: type) type {
             op_in.* = op;
         }
 
-        /// Σ (f0 + f1*x + f2*x²)[i] * rp[i], with f0/f1/f2 interleaved in ftp (stride 3).
-        inline fn convolveQuadratic(ftp: []const f64, rp: []const T, fltlen: usize, x: f64, x2: f64) T {
+        /// Σ (f0 + f1*x + f2*x²)[i] * rp[i]; ftp is planar per fir_lanes block (see FracDelayFilterBank.init).
+        inline fn convolveQuadratic(ftp: []const f64, rp: []const T, comptime fltlen: usize, x: f64, x2: f64) T {
             const L = base.fir_lanes;
             const V = @Vector(L, f64);
-            const idx = comptime blk: {
-                var r: [3][L]i32 = undefined;
-                for (0..3) |k| {
-                    for (0..L) |j| r[k][j] = @intCast(j * 3 + k);
-                }
-                break :blk r;
-            };
             const xv: V = @splat(x);
             const x2v: V = @splat(x2);
             var acc: @Vector(L, T) = @splat(0);
             var i: usize = 0;
             while (i + L <= fltlen) : (i += L) {
-                const raw: @Vector(3 * L, f64) = ftp[i * 3 ..][0 .. 3 * L].*;
-                const f0 = @shuffle(f64, raw, undefined, idx[0]);
-                const f1 = @shuffle(f64, raw, undefined, idx[1]);
-                const f2 = @shuffle(f64, raw, undefined, idx[2]);
+                const f0: V = ftp[i * 3 ..][0..L].*;
+                const f1: V = ftp[i * 3 + L ..][0..L].*;
+                const f2: V = ftp[i * 3 + 2 * L ..][0..L].*;
                 const f: @Vector(L, T) = @floatCast(f0 + f1 * xv + f2 * x2v);
                 acc += f * @as(@Vector(L, T), rp[i..][0..L].*);
             }
@@ -539,8 +499,14 @@ pub fn FracInterpolator(comptime T: type) type {
         }
 
         fn convolve2(self: *Self, op_in: *[]T) void {
+            switch (self.filter_len) {
+                inline 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30 => |n| self.convolve2N(n, op_in),
+                else => unreachable,
+            }
+        }
+
+        fn convolve2N(self: *Self, comptime fltlen: usize, op_in: *[]T) void {
             const fb = self.filter_bank;
-            const fltlen = self.filter_len;
             const ssr = self.src_sample_rate;
             const dsr = self.dst_sample_rate;
             var fpos = self.in_pos_frac;
