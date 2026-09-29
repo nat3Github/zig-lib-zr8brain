@@ -171,13 +171,24 @@ pub fn HBUpsampler(comptime T: type) type {
             @memset(&self.buf, 0);
         }
 
-        inline fn convolve(self: *Self, op: *[]T, limit: usize) void {
+        fn convolve(self: *Self, op: *[]T, limit: usize) void {
+            // ponytail: comptime tap count (1..14), like C++ convolve1..14.
+            switch (self.fltp.len) {
+                inline 1...14 => |n| self.convolveN(n, op.*.ptr, limit),
+                else => unreachable,
+            }
+        }
+
+        fn convolveN(self: *Self, comptime n: usize, op: [*]T, limit: usize) void {
+            // Locals: stores through op may alias self for the optimizer.
+            const flt = self.fltp[0..n].*;
+            const off = self.buf_rp_offset;
             var rpos = self.read_pos;
             var op_idx: usize = 0;
             while (op_idx < limit) : (op_idx += 2) {
-                const rp_idx = self.buf_rp_offset + rpos;
-                op.*[op_idx] = self.buf[rp_idx];
-                op.*[op_idx + 1] = base.firSymDot(T, self.fltp, &self.buf, rp_idx);
+                const rp_idx = off + rpos;
+                op[op_idx] = self.buf[rp_idx];
+                op[op_idx + 1] = base.firSymDot(T, &flt, &self.buf, rp_idx);
 
                 rpos = (rpos + 1) & buf_len_mask;
             }
