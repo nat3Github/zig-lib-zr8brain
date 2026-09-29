@@ -448,32 +448,37 @@ pub fn FracInterpolator(comptime T: type) type {
         }
 
         fn convolve0N(self: *Self, comptime fltlen: usize, op_in: *[]T) void {
-            const fb = self.filter_bank;
-            const istep = self.in_step;
+            // Whole-stepping banks have element_size 1, so filter i starts at i * fltlen.
+            const table = self.filter_bank.table.ptr;
             const ostep = self.out_step;
+            // istep = q*ostep + r with r < ostep: one compare-subtract replaces C++'s fpos / ostep.
+            const q = @divTrunc(self.in_step, ostep);
+            const r = self.in_step - q * ostep;
             var fpos = self.in_pos_frac_w;
             var rpos = self.read_pos;
             var bl = @as(isize, @intCast(self.buf_left)) - @as(isize, @intCast(self.fl2));
-            var op = op_in.*;
+            const op = op_in.*.ptr;
+            var n: usize = 0;
 
-            while (bl > 0) {
-                const ftp = fb.getFilter(@as(usize, @intCast(fpos)));
-                op[0] = base.firDot(T, ftp[0..fltlen], self.buf[rpos..]);
-                op = op[1..];
+            while (bl > 0 and n < op_in.len) : (n += 1) {
+                const ftp = table + @as(usize, @intCast(fpos)) * fltlen;
+                op[n] = base.firDot(T, ftp[0..fltlen], self.buf[rpos..]);
 
-                fpos += istep;
-                const pos_incr = @divTrunc(fpos, ostep);
-                fpos -= pos_incr * ostep;
+                fpos += r;
+                var pos_incr = q;
+                if (fpos >= ostep) {
+                    fpos -= ostep;
+                    pos_incr += 1;
+                }
 
                 rpos = (rpos + @as(usize, @intCast(pos_incr))) & buf_len_mask;
                 bl -= pos_incr;
-                if (op.len == 0) break;
             }
 
             self.buf_left = @intCast(bl + @as(isize, @intCast(self.fl2)));
             self.read_pos = rpos;
             self.in_pos_frac_w = fpos;
-            op_in.* = op;
+            op_in.* = op_in.*[n..];
         }
 
         /// Σ (f0 + f1*x + f2*x²)[i] * rp[i]; ftp is planar per fir_lanes block (see FracDelayFilterBank.init).
