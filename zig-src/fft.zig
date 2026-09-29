@@ -71,18 +71,25 @@ pub fn RealFFT(comptime T: type) type {
         }
 
         pub fn forward(self: *const Self, p: []T) void {
-            std.debug.assert(p.len >= self.len);
-            const out = self.work[0..self.len];
-            const scr = self.work[self.len..];
-            FloatEngine.transformOrdered(self.setup, p[0..self.len], out, scr, .Forward);
-            @memcpy(p[0..self.len], out);
+            self.run(p, .Forward);
         }
 
         pub fn inverse(self: *const Self, p: []T) void {
+            self.run(p, .Backward);
+        }
+
+        fn run(self: *const Self, p: []T, direction: zpffft.Direction) void {
             std.debug.assert(p.len >= self.len);
             const out = self.work[0..self.len];
             const scr = self.work[self.len..];
-            FloatEngine.transformOrdered(self.setup, p[0..self.len], out, scr, .Backward);
+            // An unaligned p (plain alloc) is copied to out and transformed in place.
+            const in: []const T = if (std.mem.isAligned(@intFromPtr(p.ptr), self.setup.alignment())) p[0..self.len] else blk: {
+                @memcpy(out, p[0..self.len]);
+                break :blk out;
+            };
+            // Cannot fail: out and scr are disjoint 64-aligned halves of work (alignment() <= 64),
+            // len floats each; in is out or an aligned p of len floats outside work.
+            FloatEngine.transformOrdered(self.setup, in, out, scr, direction) catch unreachable;
             @memcpy(p[0..self.len], out);
         }
 

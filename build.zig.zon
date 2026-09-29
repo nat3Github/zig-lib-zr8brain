@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zpffft = .{
-            .url = "git+https://github.com/nat3Github/zig-lib-zpffft#c2f40520b35780fb7f4087af30d24fa1f96bbcab",
-            .hash = "zpffft-0.1.0-hKRHW43TAQBzzHZlAMhqV5etnI2PSg7lc1e3IoK6gi6a",
+            .url = "git+https://github.com/nat3Github/zig-lib-zpffft#8548d6aea5b5706b6689cecd919b3386118ea6fe",
+            .hash = "zpffft-0.1.0-hKRHW-vhAQAs3lyx-6y_ZgVCpmV0DNg5je-0a-fW58od",
         },
     },
     .paths = .{
