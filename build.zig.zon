@@ -1,0 +1,27 @@
+.{
+    .fingerprint = 0x7b56ea20dd0b689a,
+    .name = .r8brain,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zpffft = .{
+            .url = "git+https://github.com/nat3Github/zig-lib-zpffft#c2f40520b35780fb7f4087af30d24fa1f96bbcab",
+            .hash = "zpffft-0.1.0-hKRHW43TAQBzzHZlAMhqV5etnI2PSg7lc1e3IoK6gi6a",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "zig-src/base.zig",
+        "zig-src/fft.zig",
+        "zig-src/filters.zig",
+        "zig-src/halfband.zig",
+        "zig-src/halfband_data.zig",
+        "zig-src/interpolator.zig",
+        "zig-src/resampler.zig",
+        "zig-src/root.zig",
+        "LICENSE",
+        "README.md",
+        "README_r8brain.md",
+    },
+}
