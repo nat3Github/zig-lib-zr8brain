@@ -82,14 +82,16 @@ pub fn RealFFT(comptime T: type) type {
             std.debug.assert(p.len >= self.len);
             const out = self.work[0..self.len];
             const scr = self.work[self.len..];
-            // An unaligned p (plain alloc) is copied to out and transformed in place.
-            const in: []const T = if (std.mem.isAligned(@intFromPtr(p.ptr), self.setup.alignment())) p[0..self.len] else blk: {
-                @memcpy(out, p[0..self.len]);
-                break :blk out;
-            };
             // Cannot fail: out and scr are disjoint 64-aligned halves of work (alignment() <= 64),
-            // len floats each; in is out or an aligned p of len floats outside work.
-            FloatEngine.transformOrdered(self.setup, in, out, scr, direction) catch unreachable;
+            // len floats each; p is outside work.
+            if (std.mem.isAligned(@intFromPtr(p.ptr), self.setup.alignment())) {
+                // In place: no copy back (BlockConvolver's blocks are 64-aligned).
+                FloatEngine.transformOrdered(self.setup, p[0..self.len], p[0..self.len], scr, direction) catch unreachable;
+                return;
+            }
+            // An unaligned p (plain alloc) is copied to out and transformed in place there.
+            @memcpy(out, p[0..self.len]);
+            FloatEngine.transformOrdered(self.setup, out, out, scr, direction) catch unreachable;
             @memcpy(p[0..self.len], out);
         }
 
