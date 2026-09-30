@@ -1,6 +1,7 @@
 const std = @import("std");
 const base = @import("base.zig");
 const filters = @import("filters.zig");
+const FIRFilterCache = filters.FIRFilterCache;
 
 pub const FracDelayFilterBank = struct {
     const Self = @This();
@@ -164,7 +165,7 @@ pub const FracDelayFilterBank = struct {
     }
 };
 
-/// LRU cache for FracDelayFilterBank instances. Thread-unsafe; caller owns.
+/// LRU cache for FracDelayFilterBank instances. Thread-unsafe; FIRFilterCache.getBank locks it.
 pub const FracDelayFilterBankCache = struct {
     const Self = @This();
 
@@ -282,7 +283,7 @@ pub fn FracInterpolator(comptime T: type) type {
         in_pos_shift: f64 = 0.0,
 
         filter_bank: *FracDelayFilterBank,
-        bank_cache: ?*FracDelayFilterBankCache,
+        bank_cache: ?*FIRFilterCache,
         is_whole: bool,
         is_bank_owned: bool,
         allocator: std.mem.Allocator,
@@ -291,7 +292,7 @@ pub fn FracInterpolator(comptime T: type) type {
             return initWithCache(allocator, src_rate, dst_rate, req_atten, is_third, prev_latency, correction_gain, null);
         }
 
-        pub fn initWithCache(allocator: std.mem.Allocator, src_rate: f64, dst_rate: f64, req_atten: f64, is_third: bool, prev_latency: f64, correction_gain: f64, bank_cache: ?*FracDelayFilterBankCache) !*Self {
+        pub fn initWithCache(allocator: std.mem.Allocator, src_rate: f64, dst_rate: f64, req_atten: f64, is_third: bool, prev_latency: f64, correction_gain: f64, bank_cache: ?*FIRFilterCache) !*Self {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
 
@@ -329,7 +330,7 @@ pub fn FracInterpolator(comptime T: type) type {
                 self.latency_frac = (spos_w - @as(f64, @floatFromInt(self.init_frac_pos_w))) / @as(f64, @floatFromInt(in_step));
 
                 if (bank_cache) |bc| {
-                    self.filter_bank = try bc.get(out_step, 1, 2, req_atten, is_third, correction_gain);
+                    self.filter_bank = try bc.getBank(out_step, 1, 2, req_atten, is_third, correction_gain);
                 } else {
                     self.filter_bank = try FracDelayFilterBank.init(allocator, out_step, 1, 2, req_atten, is_third, correction_gain);
                     self.is_bank_owned = true;
@@ -340,7 +341,7 @@ pub fn FracInterpolator(comptime T: type) type {
                 self.frac_step = src_rate / dst_rate;
 
                 if (bank_cache) |bc| {
-                    self.filter_bank = try bc.get(-1, 3, 8, req_atten, is_third, correction_gain);
+                    self.filter_bank = try bc.getBank(-1, 3, 8, req_atten, is_third, correction_gain);
                 } else {
                     self.filter_bank = try FracDelayFilterBank.init(allocator, -1, 3, 8, req_atten, is_third, correction_gain);
                     self.is_bank_owned = true;
@@ -359,7 +360,7 @@ pub fn FracInterpolator(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             if (self.bank_cache) |bc| {
-                bc.unref(self.filter_bank);
+                bc.unrefBank(self.filter_bank);
             } else if (self.is_bank_owned) {
                 self.filter_bank.deinit();
             }

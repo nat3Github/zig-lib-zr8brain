@@ -235,8 +235,10 @@ fn calcMinPhaseTransform(allocator: std.mem.Allocator, kernel: []f64, len_mult: 
 
     var ffto = try fft.RealFFT(f64).init(allocator, len_bits);
     defer ffto.deinit();
+    const work = try ffto.allocWork(allocator);
+    defer allocator.free(work);
 
-    ffto.forward(ip);
+    ffto.forward(ip, work);
 
     const nzbias = 1e-300;
 
@@ -251,7 +253,7 @@ fn calcMinPhaseTransform(allocator: std.mem.Allocator, kernel: []f64, len_mult: 
         ip[i * 2 + 1] = 0.0;
     }
 
-    ffto.inverse(ip);
+    ffto.inverse(ip, work);
 
     const m1 = ffto.inv_mul_const;
     const m2 = -m1;
@@ -261,7 +263,7 @@ fn calcMinPhaseTransform(allocator: std.mem.Allocator, kernel: []f64, len_mult: 
     ip[len2] = 0.0;
     for ((len2 + 1)..len) |i| ip[i] *= m2;
 
-    ffto.forward(ip);
+    ffto.forward(ip, work);
 
     ip[0] = ip2[0];
     ip[1] = ip2[len2];
@@ -272,7 +274,7 @@ fn calcMinPhaseTransform(allocator: std.mem.Allocator, kernel: []f64, len_mult: 
         ip[i * 2 + 1] = @sin(phase) * mag;
     }
 
-    ffto.inverse(ip);
+    ffto.inverse(ip, work);
 
     if (do_final_mul) {
         for (0..kernel_len) |i| kernel[i] = ip[i] * m1;
@@ -427,6 +429,8 @@ pub fn FIRFilter(comptime T: type) type {
 
             var ffto = try RFFT.init(self.allocator, self.block_len_bits + 1);
             defer ffto.deinit();
+            const work = try ffto.allocWork(self.allocator);
+            defer self.allocator.free(work);
 
             if (self.is_zero_phase) {
                 var s: T = 0;
@@ -446,7 +450,7 @@ pub fn FIRFilter(comptime T: type) type {
                 }
                 @memset(self.kernel_block[sinc.fl2 + 1 .. block_len * 2 - sinc.fl2 ], 0);
 
-                ffto.forward(self.kernel_block);
+                ffto.forward(self.kernel_block, work);
                 ffto.convertToZP(self.kernel_block);
             } else {
                 // Minimum phase: normalize kernel, zero-pad, forward FFT (no convertToZP)
@@ -455,7 +459,7 @@ pub fn FIRFilter(comptime T: type) type {
                 const scale = ffto.inv_mul_const * self.req_gain / dc_gain;
                 for (self.kernel_block[0..self.kernel_len]) |*v| v.* *= scale;
                 @memset(self.kernel_block[self.kernel_len .. block_len * 2], 0);
-                ffto.forward(self.kernel_block);
+                ffto.forward(self.kernel_block, work);
             }
         }
     };
@@ -495,6 +499,8 @@ pub fn BlockConvolver(comptime T: type) type {
         down_skip_init: usize,
         
         work_blocks: []T,
+        /// FFT scratch (2 * block_len2), per convolver so the cached FFTs stay read-only.
+        fft_work: []align(64) T,
         do_consume_latency: bool,
         cache: *FIRFilterCache,
         allocator: std.mem.Allocator,
@@ -504,6 +510,8 @@ pub fn BlockConvolver(comptime T: type) type {
             std.debug.assert(down_factor > 0);
             std.debug.assert(prev_latency >= 0.0);
 
+            // Owns the caller's reference to filter from here on, also on failure.
+            errdefer cache.unref(filter);
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             
@@ -514,6 +522,7 @@ pub fn BlockConvolver(comptime T: type) type {
                 .do_consume_latency = do_consume_latency,
                 .block_len2 = @as(usize, 2) << @as(std.math.Log2Int(usize), @intCast(filter.block_len_bits)),
                 .work_blocks = &[_]T{},
+                .fft_work = &.{},
                 .prev_input = &[_]T{},
                 .cur_input = &[_]T{},
                 .cur_output = &[_]T{},
@@ -597,22 +606,24 @@ pub fn BlockConvolver(comptime T: type) type {
                 }
             }
 
-            self.fftin = try cache.fft_cache.get(fftin_bits);
+            self.fftin = try cache.getFFT(fftin_bits);
 
             if (fftout_bits == fftin_bits) {
                 self.fftout = self.fftin;
             } else {
-                const fftout = try cache.fft_cache.get(fftout_bits);
+                const fftout = try cache.getFFT(fftout_bits);
                 self.ffto2 = fftout;
                 self.fftout = fftout;
             }
 
-            self.work_blocks = try allocator.alignedAlloc(T, .@"64", self.block_len2 * 2 + self.prev_input_len);
+            // [cur_input | cur_output | fft_work | prev_input]: every part but the last stays 64-aligned.
+            self.work_blocks = try allocator.alignedAlloc(T, .@"64", self.block_len2 * 4 + self.prev_input_len);
             @memset(self.work_blocks, 0);
 
             self.cur_input = self.work_blocks[0 .. self.block_len2];
             self.cur_output = self.work_blocks[self.block_len2 .. self.block_len2 * 2];
-            self.prev_input = self.work_blocks[self.block_len2 * 2 ..];
+            self.fft_work = @alignCast(self.work_blocks[self.block_len2 * 2 .. self.block_len2 * 4]);
+            self.prev_input = self.work_blocks[self.block_len2 * 4 ..];
             
             self.clear();
             return self;
@@ -904,7 +915,7 @@ pub fn BlockConvolver(comptime T: type) type {
                 @memcpy(self.cur_input[ilu .. ilu + self.prev_input_len], self.prev_input[0..self.prev_input_len]);
                 @memcpy(self.prev_input[0..self.prev_input_len], self.cur_input[ilu - self.prev_input_len .. (ilu - self.prev_input_len) + self.prev_input_len]);
                 
-                self.fftin.forward(self.cur_input);
+                self.fftin.forward(self.cur_input, self.fft_work);
                 if (self.up_shift > 0) {
                     self.mirrorInputSpectrum(self.cur_input);
                 }
@@ -922,7 +933,7 @@ pub fn BlockConvolver(comptime T: type) type {
                     self.cur_input[1] = kb[z] * self.cur_input[z] - kb[z + 1] * self.cur_input[z + 1];
                 }
                 
-                self.fftout.inverse(self.cur_input);
+                self.fftout.inverse(self.cur_input, self.fft_work);
                 self.copyToOutput(@as(isize, @intCast(offs)) - @as(isize, @intCast(self.out_offset)), &op, b, &l0);
                 
                 const tmp = self.cur_input;
@@ -934,8 +945,13 @@ pub fn BlockConvolver(comptime T: type) type {
     };
 }
 
+/// Filters, filter banks and FFT setups shared by every Resampler built on this cache.
+/// With `initThreadSafe`, Resamplers on different threads may share it: init/deinit of
+/// convolvers and interpolators take `mutex`; everything handed out is read-only after
+/// publish, so process() never touches the cache. deinit only after all users are gone.
 pub const FIRFilterCache = struct {
     const Self = @This();
+    const FracDelayFilterBank = @import("interpolator.zig").FracDelayFilterBank;
     const max_cached: usize = 96;
 
     const Entry = struct {
@@ -954,6 +970,9 @@ pub const FIRFilterCache = struct {
     count: usize,
     fft_cache: fft.RealFFTCache,
     bank_cache: @import("interpolator.zig").FracDelayFilterBankCache,
+    /// null: single-threaded, no locking.
+    io: ?std.Io = null,
+    mutex: std.Io.Mutex = .init,
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
@@ -963,6 +982,39 @@ pub const FIRFilterCache = struct {
             .fft_cache = fft.RealFFTCache.init(allocator),
             .bank_cache = @import("interpolator.zig").FracDelayFilterBankCache.init(allocator),
         };
+    }
+
+    /// Same as init, but every cache access locks one mutex through io.
+    pub fn initThreadSafe(allocator: std.mem.Allocator, io: std.Io) Self {
+        var self = init(allocator);
+        self.io = io;
+        return self;
+    }
+
+    fn lock(self: *Self) void {
+        if (self.io) |io| self.mutex.lockUncancelable(io);
+    }
+
+    fn unlock(self: *Self) void {
+        if (self.io) |io| self.mutex.unlock(io);
+    }
+
+    pub fn getFFT(self: *Self, len_bits: usize) !*fft.RealFFT(f64) {
+        self.lock();
+        defer self.unlock();
+        return self.fft_cache.get(len_bits);
+    }
+
+    pub fn getBank(self: *Self, filter_fracs: i32, element_size: usize, interp_points: usize, req_atten: f64, is_third: bool, correction_gain: f64) !*FracDelayFilterBank {
+        self.lock();
+        defer self.unlock();
+        return self.bank_cache.get(filter_fracs, element_size, interp_points, req_atten, is_third, correction_gain);
+    }
+
+    pub fn unrefBank(self: *Self, bank: *FracDelayFilterBank) void {
+        self.lock();
+        defer self.unlock();
+        self.bank_cache.unref(bank);
     }
 
     pub fn deinit(self: *Self) void {
@@ -980,6 +1032,8 @@ pub const FIRFilterCache = struct {
     }
 
     pub fn getLPFilter(self: *Self, norm_freq: f64, trans_band: f64, atten: f64, phase: FilterPhaseResponse, gain: f64) !*FIRFilter(f64) {
+        self.lock();
+        defer self.unlock();
         var prev: ?*Entry = null;
         var cur = self.head;
 
@@ -1038,6 +1092,8 @@ pub const FIRFilterCache = struct {
     }
 
     pub fn unref(self: *Self, filter: *FIRFilter(f64)) void {
+        self.lock();
+        defer self.unlock();
         var cur = self.head;
         while (cur) |entry| {
             if (entry.filter == filter) {

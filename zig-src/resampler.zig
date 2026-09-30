@@ -134,7 +134,7 @@ pub fn Resampler(comptime T: type) type {
                         false,
                         cur_lat,
                         1.0,
-                        &cache.bank_cache,
+                        cache,
                     );
                     const interp_proc = interp.processor();
                     try self.addProcessor(interp_proc);
@@ -173,7 +173,7 @@ pub fn Resampler(comptime T: type) type {
                         cur_lat = proc_up.getLatencyFrac();
                     }
                 } else {
-                    const interp = try interpolator.FracInterpolator(f64).initWithCache(allocator, src_rate2, dst_rate, req_atten, false, cur_lat, 1.0, &cache.bank_cache);
+                    const interp = try interpolator.FracInterpolator(f64).initWithCache(allocator, src_rate2, dst_rate, req_atten, false, cur_lat, 1.0, cache);
                     try self.addProcessor(interp.processor());
                 }
                 return try self.finalizeInit();
@@ -239,7 +239,7 @@ pub fn Resampler(comptime T: type) type {
                         allocator,
                         src_rate,
                         dst_rate * @as(f64, @floatFromInt(src_sr_div)),
-                        req_atten, is_third, cur_lat, 1.0, &cache.bank_cache);
+                        req_atten, is_third, cur_lat, 1.0, cache);
                     try self.addProcessor(interp.processor());
                 }
                 return try self.finalizeInit();

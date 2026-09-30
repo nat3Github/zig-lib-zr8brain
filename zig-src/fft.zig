@@ -1,7 +1,7 @@
 const std = @import("std");
 const zpffft = @import("zpffft");
 
-/// Cache for RealFFT(f64) setups keyed by len_bits. Thread-unsafe; caller owns.
+/// Cache for RealFFT(f64) setups keyed by len_bits. Thread-unsafe; FIRFilterCache.getFFT locks it.
 pub const RealFFTCache = struct {
     const max_len_bits = 32;
     entries: [max_len_bits]?*RealFFT(f64) = [_]?*RealFFT(f64){null} ** max_len_bits,
@@ -39,7 +39,6 @@ pub fn RealFFT(comptime T: type) type {
         inv_mul_const: T,
         
         setup: *FloatEngine.Setup,
-        work: []align(64) T,
         allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator, len_bits: usize) !*Self {
@@ -56,32 +55,35 @@ pub fn RealFFT(comptime T: type) type {
                 .len = len,
                 .inv_mul_const = 1.0 / @as(T, @floatFromInt(len)),
                 .setup = setup,
-                .work = try allocator.alignedAlloc(T, .@"64", len * 2),
                 .allocator = allocator,
             };
-            @memset(self.work, 0);
-            
+
             return self;
         }
 
         pub fn deinit(self: *Self) void {
             self.setup.deinit();
-            self.allocator.free(self.work);
             self.allocator.destroy(self);
         }
 
-        pub fn forward(self: *const Self, p: []T) void {
-            self.run(p, .Forward);
+        /// `work`: caller-owned scratch of at least len * 2 (see allocWork). The FFT itself is
+        /// read-only, so one instance can serve many threads, each with its own work.
+        pub fn forward(self: *const Self, p: []T, work: []align(64) T) void {
+            self.run(p, work, .Forward);
         }
 
-        pub fn inverse(self: *const Self, p: []T) void {
-            self.run(p, .Backward);
+        pub fn inverse(self: *const Self, p: []T, work: []align(64) T) void {
+            self.run(p, work, .Backward);
         }
 
-        fn run(self: *const Self, p: []T, direction: zpffft.Direction) void {
-            std.debug.assert(p.len >= self.len);
-            const out = self.work[0..self.len];
-            const scr = self.work[self.len..];
+        pub fn allocWork(self: *const Self, allocator: std.mem.Allocator) ![]align(64) T {
+            return allocator.alignedAlloc(T, .@"64", self.len * 2);
+        }
+
+        fn run(self: *const Self, p: []T, work: []align(64) T, direction: zpffft.Direction) void {
+            std.debug.assert(p.len >= self.len and work.len >= self.len * 2);
+            const out = work[0..self.len];
+            const scr = work[self.len..][0..self.len];
             // Cannot fail: out and scr are disjoint 64-aligned halves of work (alignment() <= 64),
             // len floats each; p is outside work.
             if (std.mem.isAligned(@intFromPtr(p.ptr), self.setup.alignment())) {
